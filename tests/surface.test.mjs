@@ -26,6 +26,7 @@ assert.doesNotMatch(JSON.stringify(mcp), /cargo|pwsh|powershell/i);
 for (const tool of [
   "canmore_medium_recipe",
   "canmore_medium_create",
+  "canmore_medium_serve",
   "canmore_medium_event",
   "canmore_medium_read",
   "canmore_medium_promote",

@@ -25,7 +25,7 @@ user intent
 | Medium surfaces | Stores title, purpose, medium type, cards, promotion state, and events. |
 | Feedback events | Stores clicks, selections, slider changes, notes, and plugin-defined signals when Codex or plugin code reports them as structured data. |
 | Image lane | Registers local files produced by the host built-in `image_gen`; no image API keys or direct generation calls. |
-| HTML view | Writes a local static preview for each surface so the medium can be inspected without starting a web stack. |
+| Live view | Serves each surface through a tiny local Rust HTTP server so the user can touch the medium and Codex can read the resulting events. |
 | Context budget | Tool responses are compact unless the caller asks for full spec or events. |
 
 ## Boundary
@@ -40,7 +40,11 @@ The plugin ships one MCP server:
 bin/canmored.exe mcp
 ```
 
-The binary is built from `server/`. The MCP config launches the native runtime directly.
+The binary is built from `server/`. The MCP config launches the native runtime directly. The same runtime can serve live surfaces:
+
+```text
+bin/canmored.exe serve 127.0.0.1:8787
+```
 
 ## Commands
 

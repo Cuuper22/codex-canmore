@@ -26,6 +26,7 @@
     "category": "Developer",
     "capabilities": [
       "Generated Medium Surfaces",
+      "Live Browser Surfaces",
       "Structured Feedback",
       "Local State",
       "Image Generation Asset Registration"

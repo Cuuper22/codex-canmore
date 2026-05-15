@@ -1,8 +1,13 @@
 use std::{
     fs,
-    io::{self, BufRead, Write},
+    io::{self, BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -11,17 +16,30 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static LIVE_SERVER_URL: OnceLock<String> = OnceLock::new();
 
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "mcp".to_string());
-    if mode != "mcp" {
-        eprintln!("usage: canmored mcp");
-        std::process::exit(2);
-    }
-
-    if let Err(error) = run_mcp() {
-        eprintln!("{error}");
-        std::process::exit(1);
+    match mode.as_str() {
+        "mcp" => {
+            if let Err(error) = run_mcp() {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        "serve" => {
+            let bind = std::env::args()
+                .nth(2)
+                .unwrap_or_else(|| "127.0.0.1:8787".to_string());
+            if let Err(error) = run_http_server(bind) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        _ => {
+            eprintln!("usage: canmored mcp | canmored serve [host:port]");
+            std::process::exit(2);
+        }
     }
 }
 
@@ -41,6 +59,25 @@ fn run_mcp() -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+fn run_http_server(bind: String) -> Result<(), String> {
+    let store = Store::open(std::env::current_dir().map_err(|error| error.to_string())?)?;
+    let listener = TcpListener::bind(&bind).map_err(|error| error.to_string())?;
+    let address = listener.local_addr().map_err(|error| error.to_string())?;
+    eprintln!("canmore live surface server listening on http://{address}");
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let store = store.clone();
+                thread::spawn(move || {
+                    let _ = handle_http_stream(&store, stream);
+                });
+            }
+            Err(error) => eprintln!("{error}"),
+        }
+    }
     Ok(())
 }
 
@@ -133,6 +170,16 @@ fn call_tool(store: &Store, name: &str, args: Value) -> Result<Value, String> {
                 .unwrap_or(20)
                 .min(100) as usize;
             Ok(json!({ "surfaces": store.list_surfaces(limit)? }))
+        }
+        "canmore_medium_serve" => {
+            let id = args.get("id").and_then(Value::as_str);
+            let base_url = store.live_server_url()?;
+            let surface_url = id.map(|id| format!("{base_url}/surfaces/{id}"));
+            Ok(json!({
+                "base_url": base_url,
+                "surface_url": surface_url,
+                "mode": "live-browser-surface"
+            }))
         }
         "canmore_medium_promote" => {
             let id = required_string(&args, "id")?;
@@ -258,6 +305,7 @@ fn default_ephemeral() -> bool {
     true
 }
 
+#[derive(Clone)]
 struct Store {
     root: PathBuf,
 }
@@ -384,6 +432,31 @@ impl Store {
         });
         surfaces.truncate(limit);
         Ok(surfaces)
+    }
+
+    fn live_server_url(&self) -> Result<String, String> {
+        if let Some(url) = LIVE_SERVER_URL.get() {
+            return Ok(url.clone());
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        let url = format!("http://{address}");
+        let store = self.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let store = store.clone();
+                        thread::spawn(move || {
+                            let _ = handle_http_stream(&store, stream);
+                        });
+                    }
+                    Err(error) => eprintln!("{error}"),
+                }
+            }
+        });
+        let _ = LIVE_SERVER_URL.set(url.clone());
+        Ok(url)
     }
 
     fn register_asset(&self, input: AssetInput) -> Result<AssetRecord, String> {
@@ -584,6 +657,14 @@ fn tools() -> Vec<Value> {
             }),
         ),
         tool(
+            "canmore_medium_serve",
+            "Start or reuse the local live browser surface server and return URLs.",
+            json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" } }
+            }),
+        ),
+        tool(
             "canmore_medium_promote",
             "Mark a surface as durable project material.",
             json!({
@@ -615,6 +696,173 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({ "name": name, "description": description, "inputSchema": input_schema })
 }
 
+fn handle_http_stream(store: &Store, mut stream: TcpStream) -> Result<(), String> {
+    let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .map_err(|error| error.to_string())?;
+    if request_line.trim().is_empty() {
+        return Ok(());
+    }
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("/");
+    let mut content_length = 0usize;
+    loop {
+        let mut header = String::new();
+        reader
+            .read_line(&mut header)
+            .map_err(|error| error.to_string())?;
+        let trimmed = header.trim_end();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse::<usize>().unwrap_or(0);
+            }
+        }
+    }
+    let mut body = vec![0; content_length];
+    if content_length > 0 {
+        reader
+            .read_exact(&mut body)
+            .map_err(|error| error.to_string())?;
+    }
+    let body = String::from_utf8_lossy(&body);
+    let response = handle_http_request(store, method, path, &body);
+    write_http_response(&mut stream, response)
+}
+
+fn handle_http_request(store: &Store, method: &str, path: &str, body: &str) -> HttpResponse {
+    let path = path.split('?').next().unwrap_or(path);
+    match (method, path) {
+        ("GET", "/") => match store.list_surfaces(30) {
+            Ok(surfaces) => HttpResponse::html(render_index_html(&surfaces)),
+            Err(error) => HttpResponse::text(500, error),
+        },
+        ("POST", "/event") => match serde_json::from_str::<EventInput>(body)
+            .map_err(|error| error.to_string())
+            .and_then(|input| store.record_event(input))
+        {
+            Ok(value) => HttpResponse::json(value),
+            Err(error) => HttpResponse::text(400, error),
+        },
+        ("POST", "/promote") => match serde_json::from_str::<Value>(body)
+            .map_err(|error| error.to_string())
+            .and_then(|value| {
+                let id = required_string(&value, "id")?;
+                let note = value
+                    .get("note")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                store.promote_surface(&id, note)
+            }) {
+            Ok(value) => HttpResponse::json(value),
+            Err(error) => HttpResponse::text(400, error),
+        },
+        _ if method == "GET" && path.starts_with("/surfaces/") => {
+            let id = path.trim_start_matches("/surfaces/");
+            match store.read_surface_file(id) {
+                Ok(surface) => HttpResponse::html(render_surface_html(&surface)),
+                Err(error) => HttpResponse::text(404, error),
+            }
+        }
+        _ if method == "GET" && path.starts_with("/api/surfaces/") => {
+            let id = path.trim_start_matches("/api/surfaces/");
+            match store.read_surface(id, true, true) {
+                Ok(surface) => HttpResponse::json(surface),
+                Err(error) => HttpResponse::text(404, error),
+            }
+        }
+        _ => HttpResponse::text(404, "not found".to_string()),
+    }
+}
+
+struct HttpResponse {
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+}
+
+impl HttpResponse {
+    fn html(body: String) -> Self {
+        Self {
+            status: 200,
+            content_type: "text/html; charset=utf-8",
+            body: body.into_bytes(),
+        }
+    }
+
+    fn json(value: Value) -> Self {
+        Self {
+            status: 200,
+            content_type: "application/json; charset=utf-8",
+            body: serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec()),
+        }
+    }
+
+    fn text(status: u16, body: String) -> Self {
+        Self {
+            status,
+            content_type: "text/plain; charset=utf-8",
+            body: body.into_bytes(),
+        }
+    }
+}
+
+fn write_http_response(stream: &mut TcpStream, response: HttpResponse) -> Result<(), String> {
+    let reason = match response.status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "OK",
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+        response.status,
+        reason,
+        response.content_type,
+        response.body.len()
+    )
+    .map_err(|error| error.to_string())?;
+    stream
+        .write_all(&response.body)
+        .map_err(|error| error.to_string())
+}
+
+fn render_index_html(surfaces: &[Value]) -> String {
+    let links = surfaces
+        .iter()
+        .filter_map(|surface| {
+            let id = surface.get("id")?.as_str()?;
+            let title = surface.get("title")?.as_str()?;
+            let medium = surface
+                .get("medium")
+                .and_then(Value::as_str)
+                .unwrap_or("medium");
+            Some(format!(
+                "<a href=\"/surfaces/{id}\"><strong>{}</strong><span>{}</span></a>",
+                escape(title),
+                escape(medium)
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Canmore surfaces</title><style>
+        body {{ margin: 0; background: #101613; color: #e5fff6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }}
+        main {{ max-width: 900px; margin: 0 auto; padding: 28px; }}
+        a {{ display: grid; gap: 6px; margin: 10px 0; padding: 14px; color: inherit; text-decoration: none; border: 1px solid #26342f; border-radius: 8px; background: #151d1a; }}
+        span {{ color: #34d399; font-size: 12px; text-transform: uppercase; }}
+        </style></head><body><main><h1>Canmore surfaces</h1>{}</main></body></html>"#,
+        links
+    )
+}
+
 fn render_surface_html(surface: &Surface) -> String {
     let cards = surface
         .cards
@@ -628,12 +876,13 @@ fn render_surface_html(surface: &Surface) -> String {
                 )
             });
             format!(
-                "<article class=\"card card-{}\"><span>{}</span><h2>{}</h2><p>{}</p>{}</article>",
+                "<article class=\"card card-{}\"><span>{}</span><h2>{}</h2><p>{}</p>{}<button data-kind=\"selected\" data-target=\"{}\">Use this</button></article>",
                 class,
                 escape(&card.kind),
                 escape(&card.title),
                 escape(&card.body),
-                meter
+                meter,
+                escape(&card.title)
             )
         })
         .collect::<Vec<_>>()
@@ -674,6 +923,12 @@ fn render_surface_html(surface: &Surface) -> String {
     .medium-board {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin: 14px 0; }}
     .card {{ min-height: 136px; padding: 15px; }}
     .card h2 {{ margin: 10px 0 8px; font-size: 17px; }}
+    button, input, textarea {{ font: inherit; }}
+    button {{ margin-top: 12px; padding: 7px 10px; border: 1px solid #36584b; border-radius: 999px; background: #16251f; color: #d9fff0; cursor: pointer; }}
+    button:hover {{ border-color: #34d399; }}
+    .live-controls {{ display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; margin: 14px 0; }}
+    .live-controls input {{ min-width: 0; padding: 10px 12px; border: 1px solid #26342f; border-radius: 8px; background: #151d1a; color: #e5fff6; }}
+    .live-controls button {{ margin-top: 0; border-radius: 8px; }}
     .card-diagram {{ grid-column: span 2; }}
     .card-matrix {{ background: linear-gradient(135deg, #151d1a 0%, #17231f 100%); }}
     .card-chart .meter {{ height: 10px; }}
@@ -693,10 +948,52 @@ fn render_surface_html(surface: &Surface) -> String {
       <div><span class="eyebrow">Canmore medium</span><h1>{}</h1><p>{}</p></div>
       <strong class="badge">{}</strong>
     </header>
+    <section class="live-controls">
+      <input id="canmore-note" placeholder="Send a note back into the surface">
+      <button id="canmore-note-send">Record note</button>
+      <button id="canmore-promote">Promote</button>
+    </section>
     <section class="medium-board">{}</section>
     <section class="events"><strong>Feedback events</strong><div>{}</div></section>
     <section class="promotion"><strong>Promotion</strong><p>{}</p></section>
   </main>
+  <script>
+    const surfaceId = "{}";
+    const eventList = document.querySelector(".events div");
+    const addEvent = (kind, target) => {{
+      const pill = document.createElement("span");
+      pill.textContent = `${{kind}}: ${{target || "surface"}}`;
+      const empty = eventList.querySelector("em");
+      if (empty) empty.remove();
+      eventList.prepend(pill);
+    }};
+    async function postEvent(kind, target, note) {{
+      const response = await fetch("/event", {{
+        method: "POST",
+        headers: {{ "content-type": "application/json" }},
+        body: JSON.stringify({{ id: surfaceId, kind, target, note }})
+      }});
+      if (!response.ok) throw new Error(await response.text());
+      addEvent(kind, target);
+    }}
+    document.querySelectorAll("[data-kind]").forEach((button) => {{
+      button.addEventListener("click", () => postEvent(button.dataset.kind, button.dataset.target, null));
+    }});
+    document.getElementById("canmore-note-send").addEventListener("click", () => {{
+      const input = document.getElementById("canmore-note");
+      const note = input.value.trim();
+      if (!note) return;
+      postEvent("note", "surface", note).then(() => input.value = "");
+    }});
+    document.getElementById("canmore-promote").addEventListener("click", async () => {{
+      const response = await fetch("/promote", {{
+        method: "POST",
+        headers: {{ "content-type": "application/json" }},
+        body: JSON.stringify({{ id: surfaceId, note: "Promoted from live surface." }})
+      }});
+      if (response.ok) addEvent("promoted", "project material");
+    }});
+  </script>
 </body>
 </html>"#,
         escape(&surface.title),
@@ -706,7 +1003,8 @@ fn render_surface_html(surface: &Surface) -> String {
         escape(&surface.medium),
         cards,
         event_body,
-        escape(&surface.promotion)
+        escape(&surface.promotion),
+        escape_js(&surface.id)
     )
 }
 
@@ -744,6 +1042,14 @@ fn escape(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn escape_js(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 fn class_token(input: &str) -> String {
