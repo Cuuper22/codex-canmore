@@ -1,0 +1,29 @@
+{
+  "name": "codex-canmore",
+  "version": "1.0.0",
+  "private": false,
+  "type": "module",
+  "files": [
+    ".codex-plugin/plugin.json",
+    ".mcp.json",
+    "AGENTS.md",
+    "LICENSE",
+    "README.md",
+    "bin/canmored.exe",
+    "scripts/build.ps1",
+    "server/Cargo.lock",
+    "server/Cargo.toml",
+    "server/src/main.rs",
+    "skills/canmore/SKILL.md",
+    "tests/surface.test.mjs"
+  ],
+  "scripts": {
+    "build": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
+    "pretest": "npm run build",
+    "test": "npm run test:rust && npm run test:surface",
+    "test:rust": "cargo +stable-x86_64-pc-windows-gnu test --locked --manifest-path server/Cargo.toml",
+    "test:surface": "node tests/surface.test.mjs",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {}
+}

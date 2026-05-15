@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "codex-canmore": {
+      "command": "./bin/canmored.exe",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

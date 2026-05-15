@@ -1,0 +1,43 @@
+{
+  "name": "codex-canmore",
+  "version": "1.0.0",
+  "description": "Rust-first medium layer for Codex Desktop.",
+  "author": {
+    "name": "Cuper Ashraf",
+    "url": "https://github.com/Cuuper22"
+  },
+  "homepage": "https://github.com/Cuuper22/codex-canmore",
+  "repository": "https://github.com/Cuuper22/codex-canmore",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "medium",
+    "interfaces",
+    "mcp",
+    "rust"
+  ],
+  "skills": "./skills",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Canmore",
+    "shortDescription": "On-demand visual medium layers for Codex.",
+    "longDescription": "Canmore lets Codex create temporary visual medium surfaces, record structured feedback events, and promote useful surfaces into durable project material.",
+    "developerName": "Cuper Ashraf",
+    "category": "Developer",
+    "capabilities": [
+      "Generated Medium Surfaces",
+      "Structured Feedback",
+      "Local State",
+      "Image Generation Asset Registration"
+    ],
+    "websiteURL": "https://github.com/Cuuper22/codex-canmore",
+    "privacyPolicyURL": "https://github.com/Cuuper22/codex-canmore/blob/main/README.md#boundary",
+    "termsOfServiceURL": "https://github.com/Cuuper22/codex-canmore/blob/main/LICENSE",
+    "defaultPrompt": [
+      "Create a temporary medium surface for this decision.",
+      "Turn this explanation into a diagram-plus-feedback surface.",
+      "Register this built-in image_gen output against the current surface."
+    ],
+    "brandColor": "#34D399"
+  }
+}

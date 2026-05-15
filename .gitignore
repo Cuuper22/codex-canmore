@@ -1,0 +1,4 @@
+node_modules/
+server/target/
+.canmore-medium/
+npm-debug.log*
